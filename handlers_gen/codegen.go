@@ -86,6 +86,7 @@ const commonCode = `
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -96,17 +97,25 @@ const (
 	mustNotBeEmptyPostfix = " must me not empty"
 	shouldBeInteger       = " must be int"
 	lenStringMustBeGrateThan = " len must be >= "
-	minIntError = " must be >= %%d"
-	maxIntError = " must be <= %%d"
-	enumError = " must be one of [%%s]"
+	minIntError = " must be >= "
+	maxIntError = " must be <= "
+	enumError = " must be one of [%s]"
 )
 
 func handleError(w http.ResponseWriter, err error) {
-	var apiError *ApiError
-	if errors.As(err, apiError) {
+	var apiError ApiError
+	if errors.As(err, &apiError) {
 		w.WriteHeader(apiError.HTTPStatus)
+	} else {
+		w.WriteHeader(500)
 	}
-	w.Write([]byte(err.Error()))
+	out := map[string]string{"error": err.Error()}
+	body, err := json.Marshal(out)
+	if err != nil {
+		// TODO: add logging
+		return
+	}
+	w.Write(body)
 }
 
 func getRequestParams(r *http.Request) (map[string][]string, error) {
@@ -150,15 +159,15 @@ func (srv *{{.StructName}}) wrapper{{.MethodName}}(w http.ResponseWriter, r *htt
 	if err := srv.authorizeRequest(r); err != nil {
 		handleError(w, err)
 		return 
-	}{{ end }}
+	}{{ end }}{{if ne .ApiGenSettings.Method ""}}
 	// check http method
 	if r.Method != "{{.ApiGenSettings.Method}}" {
-		handleError(w, &ApiError{
-			HTTPStatus: 400,
+		handleError(w, ApiError{
+			HTTPStatus: http.StatusNotAcceptable,
 			Err:        errors.New("bad method"),
 		})
 		return
-	}
+	}{{end}}
 	paramsMap, err := getRequestParams(r)
 	if err != nil {
 		handleError(w, err)
@@ -174,7 +183,10 @@ func (srv *{{.StructName}}) wrapper{{.MethodName}}(w http.ResponseWriter, r *htt
 		handleError(w, err)
 		return
 	}
-	body, err := json.Marshal(out)
+	body, err := json.Marshal(map[string]interface{}{
+		"error": "",
+		"response": out,
+	})
 	if err != nil {
 		handleError(w, err)
 		return
@@ -187,8 +199,8 @@ func (srv *{{.StructName}}) wrapper{{.MethodName}}(w http.ResponseWriter, r *htt
 // authorizeRequest check authorization
 func (srv *{{.StructName}}) authorizeRequest(r *http.Request) error {
 	if r.Header.Get("X-Auth") != "100500" {
-		return &ApiError{
-			HTTPStatus: 401,
+		return ApiError{
+			HTTPStatus: http.StatusForbidden,
 			Err: errors.New("unauthorized"),
 		}
 	}
@@ -197,10 +209,13 @@ func (srv *{{.StructName}}) authorizeRequest(r *http.Request) error {
 `))
 
 	stringValidationTemplate = template.Must(
-		template.New("stringValidationTemplate").Parse(`
+		template.New("stringValidationTemplate").Funcs(template.FuncMap{"StringJoin": strings.Join}).Parse(`
 {{ $length := len .Enum}}{{ if ne $length 0 }}
 // Enum for {{.FieldName}} of {{.StructName}} structure
-var enum{{.StructName}}{{.FieldName}} = []string{ {{range .Enum}}"{{.}}",{{end}} }
+var (
+	enum{{.StructName}}{{.FieldName}} = []string{ {{range .Enum}}"{{.}}",{{end}} }
+	enum{{.StructName}}{{.FieldName}}Error = "{{.ParamName}}" + fmt.Sprintf(enumError, "{{StringJoin .Enum ", "}}")
+)
 {{end}}
 
 // Getter {{.FieldName}} of {{.StructName}} structure
@@ -214,21 +229,21 @@ func get{{.StructName}}{{.FieldName}}(params map[string][]string) (string,error)
 		value = "{{ .Default }}"
 	}{{ end }}{{ if .Required }}
 	if value == "" {
-		return "", &ApiError{
-			HTTPStatus: 400,
-			Err:        errors.New("{{.FieldName}}" + mustNotBeEmptyPostfix),
+		return "", ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("{{.ParamName}}" + mustNotBeEmptyPostfix),
 		}
 	}{{ end }}{{ $length := len .Enum}}{{ if ne $length 0 }}
 	if !hasStringInSlice(value, enum{{.StructName}}{{.FieldName}}) {
-		return "", &ApiError{
-			HTTPStatus: 400,
-			Err:        errors.New("{{.FieldName}}" + mustNotBeEmptyPostfix),
+		return "", ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New(enum{{.StructName}}{{.FieldName}}Error),
 		}
 	}{{ end }}{{ if .Min }}
 	if len(value) < {{ .Min }} {
-		return "", &ApiError{
-			HTTPStatus: 400,
-			Err:        errors.New("{{.FieldName}}" + lenStringMustBeGrateThan + "{{ .Min }}"),
+		return "", ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("{{.ParamName}}" + lenStringMustBeGrateThan + "{{ .Min }}"),
 		}
 	}{{ end }}
 	return value, nil
@@ -249,9 +264,9 @@ func get{{.StructName}}{{.FieldName}}(params map[string][]string) (int,error) {
 	if value != "" {
 		num, err = strconv.Atoi(value)
 		if err != nil {
-			return 0, &ApiError{
-				HTTPStatus: 400,
-				Err:        errors.New("{{.FieldName}}" + shouldBeInteger),
+			return 0, ApiError{
+				HTTPStatus: http.StatusBadRequest,
+				Err:        errors.New("{{.ParamName}}" + shouldBeInteger),
 			}
 		}
 	}{{ if .IsDefault }}
@@ -259,21 +274,21 @@ func get{{.StructName}}{{.FieldName}}(params map[string][]string) (int,error) {
 		num = {{.Default}}
 	}{{ end }}{{ if .Required }}
 	if required && num == 0 {
-		return 0, &ApiError{
-			HTTPStatus: 400,
-			Err:        errors.New("{{.FieldName}}" + mustNotBeEmptyPostfix),
+		return 0, ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("{{.ParamName}}" + mustNotBeEmptyPostfix),
 		}
 	}{{ end }}{{ if ne .Min  "" }}
 	if num < {{ .Min }} {
-		return 0, &ApiError{
-			HTTPStatus: 400,
-			Err:        errors.New("{{.FieldName}}" + mustNotBeEmptyPostfix),
+		return 0, ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("{{.ParamName}}" + minIntError + "{{.Min}}"),
 		}
 	}{{ end }}{{ if ne .Max "" }}
-	if max != nil && num > *max {
-		return 0, &ApiError{
-			HTTPStatus: 400,
-			Err:        errors.New("{{.FieldName}}" + mustNotBeEmptyPostfix),
+	if num > {{ .Max }} {
+		return 0, ApiError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("{{.ParamName}}" + maxIntError + "{{.Max}}"),
 		}
 	}{{ end }}
 	return num, nil
@@ -299,9 +314,9 @@ func (srv *{{.StructName}} ) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "{{.Path}}":
 		srv.wrapper{{.MethodName}}(w, r){{end}}
 	default:
-		handleError(w, &ApiError{
-			HTTPStatus: 404,
-			Err:        errors.New("path not exists"),
+		handleError(w, ApiError{
+			HTTPStatus: http.StatusNotFound,
+			Err:        errors.New("unknown method"),
 		})
 	}
 }
@@ -454,7 +469,7 @@ func parseGenerateValidationString(structName, fieldName, fieldType, comment str
 			if err != nil {
 				log.Fatal(fmt.Sprintf("field %s has bad value for argument max %s", fieldName, v))
 			}
-			settings.Min = v
+			settings.Max = v
 		default:
 			log.Fatal(fmt.Sprintf("field %s has bad argument %s", fieldName, k))
 		}
@@ -537,7 +552,7 @@ func generateMethod(out *os.File, g *ast.FuncDecl) {
 
 func checkMehodDeclartion(apiSettings *apiGenSettings) error {
 	if apiSettings.Method == "" {
-		apiSettings.Method = get
+		return nil
 	}
 	for _, m := range supportMethods {
 		if apiSettings.Method == m {
