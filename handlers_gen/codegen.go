@@ -240,7 +240,7 @@ func get{{.StructName}}{{.FieldName}}(params map[string][]string) (int,error) {
 	values := params["{{.ParamName}}"]
 	var value string
 	if len(values) > 0 {
-		value = values[1]
+		value = values[0]
 	}
 	var (
 		num int
